@@ -7,27 +7,33 @@ from datetime import datetime
 from google import genai
 
 # ============================================================
-# 再思考AI - Streamlit版
+# 再思考AI ver4.0 - 矛盾探知＋自己進化
 # ============================================================
 
 client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
 MEMORY_FILE = "memory.json"
 
+# ============================================================
+# 記憶システム
+# ============================================================
+
 def load_memory():
     if os.path.exists(MEMORY_FILE):
         with open(MEMORY_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"graph": {}, "last_updated": {}}
-
-def save_memory(graph, last_updated):
-    data = {
-        "graph": graph,
-        "last_updated": last_updated,
-        "saved_at": datetime.now().isoformat()
+    return {
+        "graph": {},
+        "last_updated": {},
+        "contradiction_log": [],  # 矛盾の記録
+        "evolution_log": [],      # 自己進化の記録
+        "topic_weights": {},      # トピックの重み（自己進化）
     }
+
+def save_memory(memory):
+    memory["saved_at"] = datetime.now().isoformat()
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(memory, f, ensure_ascii=False, indent=2)
 
 def decay_memory(graph, last_updated):
     now = datetime.now()
@@ -62,6 +68,10 @@ def update_graph(graph, last_updated, topics, top_score):
             last_updated[f"{b}↔{a}"] = now
     return graph, last_updated
 
+# ============================================================
+# コア関数
+# ============================================================
+
 def detect_purpose(text):
     short = sum(1 for w in ["すぐ","今","早く","簡単"] if w in text)
     long  = sum(1 for w in ["本質","しっかり","根本","ちゃんと"] if w in text)
@@ -69,12 +79,13 @@ def detect_purpose(text):
     elif long > short: return {"type": "long",  "weight": 0.8}
     else:              return {"type": "mid",   "weight": 0.5}
 
-def score(answer, purpose_weight, graph_bonus=0):
+def score(answer, purpose_weight, graph_bonus=0, topic_bonus=0):
     return round(
         answer["confidence"] * 60 * purpose_weight
         - answer["variation"] * 0.25
         - answer["length"] * 0.1
         + graph_bonus
+        + topic_bonus
     , 2)
 
 def graph_bonus_score(graph, topics):
@@ -83,6 +94,11 @@ def graph_bonus_score(graph, topics):
         if t in graph:
             total += sum(graph[t].values())
     return round(total * 2, 2)
+
+def topic_bonus_score(topic_weights, topics):
+    """自己進化で調整されたトピック重みをボーナスに変換"""
+    total = sum(topic_weights.get(t, 0) for t in topics)
+    return round(total, 2)
 
 def graph_pattern(graph, topics):
     hits = []
@@ -184,18 +200,115 @@ def generate_answers(query, purpose):
                 time.sleep(5)
     return []
 
-def rethink_ai(query, graph, last_updated):
+# ============================================================
+# 矛盾探知＋自己進化
+# ============================================================
+
+def detect_contradiction(scored, purpose_weight, graph_bonus):
+    """矛盾（拮抗）を検出する"""
+    if len(scored) < 2:
+        return None
+    s1 = score(scored[0], purpose_weight, graph_bonus)
+    s2 = score(scored[1], purpose_weight, graph_bonus)
+    diff = abs(s1 - s2)
+    if diff < 5:
+        return {
+            "候補A": scored[0]["text"][:30] + "...",
+            "候補B": scored[1]["text"][:30] + "...",
+            "差": round(diff, 1),
+        }
+    return None
+
+def generate_questions_from_contradiction(contradiction, topics, query):
+    """矛盾から問いを自動生成してGeminiで深掘りする"""
+    topics_str = "・".join(list(topics)[:2])
+    prompt = f"""
+以下の状況で2つの答えが拮抗しています：
+
+元の問い：「{query}」
+答えA：「{contradiction['候補A']}」
+答えB：「{contradiction['候補B']}」
+関連トピック：{topics_str}
+
+この矛盾の原因を探る重要な問いを1つ生成してください。
+その問いで再思考することで、より良い答えが見つかるような問いにしてください。
+
+必ずこのJSON形式のみで返してください：
+{{"question": "問いの内容", "reason": "なぜこの問いが重要か（30文字以内）"}}
+"""
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        text = response.text.strip()
+        start = text.find("{")
+        end   = text.rfind("}") + 1
+        return json.loads(text[start:end])
+    except:
+        return {
+            "question": f"なぜ「{topics_str}」で答えが割れるのか？",
+            "reason": "矛盾の根本を探る"
+        }
+
+def evolve(memory, topics, best_score, contradiction):
+    """
+    自己進化：
+    矛盾が起きたトピックの重みを調整する
+    成功したトピックの重みを強化する
+    """
+    evolution_log = []
+    topic_weights = memory.get("topic_weights", {})
+
+    if contradiction:
+        # 矛盾が起きたトピックは重みを少し下げる（再思考が必要なサイン）
+        for t in topics:
+            prev = topic_weights.get(t, 0)
+            topic_weights[t] = round(prev - 0.05, 3)
+            evolution_log.append(
+                f"「{t}」重みを調整（矛盾検出）: {prev:.2f}→{topic_weights[t]:.2f}"
+            )
+    elif best_score > 30:
+        # 高スコアが出たトピックは重みを強化（成功のサイン）
+        for t in topics:
+            prev = topic_weights.get(t, 0)
+            topic_weights[t] = round(prev + 0.1, 3)
+            evolution_log.append(
+                f"「{t}」重みを強化（高スコア）: {prev:.2f}→{topic_weights[t]:.2f}"
+            )
+
+    memory["topic_weights"] = topic_weights
+    memory["evolution_log"].extend(evolution_log)
+
+    # 最新10件だけ保持（軽量化）
+    memory["evolution_log"] = memory["evolution_log"][-10:]
+
+    return memory, evolution_log
+
+# ============================================================
+# メインループ ver4.0
+# ============================================================
+
+def rethink_ai(query, memory):
     purpose = detect_purpose(query)
     topics = extract_topics(query)
     candidates = generate_answers(query, purpose)
 
     if not candidates:
-        return None, graph, last_updated, None
+        return None, memory, None
+
+    graph = memory["graph"]
+    last_updated = memory["last_updated"]
+    topic_weights = memory.get("topic_weights", {})
 
     bonus = graph_bonus_score(graph, topics)
+    t_bonus = topic_bonus_score(topic_weights, topics)
+
     removed = set()
     best = None
     best_score = -999
+    contradiction = None
+    contradiction_question = None
 
     for round_num in range(1, 4):
         active = [c for c in candidates if c["id"] not in removed]
@@ -204,15 +317,30 @@ def rethink_ai(query, graph, last_updated):
 
         scored = sorted(
             active,
-            key=lambda c: score(c, purpose["weight"], bonus),
+            key=lambda c: score(c, purpose["weight"], bonus, t_bonus),
             reverse=True
         )
 
-        top_score = score(scored[0], purpose["weight"], bonus)
+        top_score = score(scored[0], purpose["weight"], bonus, t_bonus)
 
         if top_score > best_score:
             best_score = top_score
             best = scored[0]
+
+        # 矛盾探知
+        contradiction = detect_contradiction(scored, purpose["weight"], bonus)
+        if contradiction:
+            contradiction_question = generate_questions_from_contradiction(
+                contradiction, topics, query
+            )
+            # 矛盾ログに記録
+            memory["contradiction_log"].append({
+                "query": query,
+                "question": contradiction_question["question"],
+                "reason": contradiction_question["reason"],
+                "time": datetime.now().isoformat()
+            })
+            memory["contradiction_log"] = memory["contradiction_log"][-10:]
 
         graph, last_updated = update_graph(
             graph, last_updated, topics, top_score / 100
@@ -223,30 +351,40 @@ def rethink_ai(query, graph, last_updated):
 
         removed.add(scored[-1]["id"])
 
-    save_memory(graph, last_updated)
+    memory["graph"] = graph
+    memory["last_updated"] = last_updated
+
+    # 自己進化
+    memory, evolution_log = evolve(memory, topics, best_score, contradiction)
+
+    save_memory(memory)
 
     spark_pick, sparked = probabilistic_spark(
         sorted(candidates,
-               key=lambda c: score(c, purpose["weight"], bonus),
+               key=lambda c: score(c, purpose["weight"], bonus, t_bonus),
                reverse=True)
     )
 
     patterns = graph_pattern(graph, topics)
 
-    return best, graph, last_updated, {
+    return best, memory, {
         "purpose":    purpose,
         "topics":     topics,
         "bonus":      bonus,
+        "t_bonus":    t_bonus,
         "best":       best,
         "best_score": best_score,
         "candidates": sorted(
             candidates,
-            key=lambda c: score(c, purpose["weight"], bonus),
+            key=lambda c: score(c, purpose["weight"], bonus, t_bonus),
             reverse=True
         ),
-        "sparked":    sparked,
-        "spark_pick": spark_pick,
-        "patterns":   patterns,
+        "sparked":       sparked,
+        "spark_pick":    spark_pick,
+        "patterns":      patterns,
+        "contradiction": contradiction,
+        "contradiction_question": contradiction_question,
+        "evolution_log": evolution_log,
     }
 
 # ============================================================
@@ -259,18 +397,17 @@ st.set_page_config(
     layout="centered"
 )
 
-st.title("🧠 再思考AI")
-st.caption("どんな問いでも3つの視点から考えます")
+st.title("🧠 再思考AI ver4.0")
+st.caption("矛盾を探り・自己進化する再思考AI")
 
 # 記憶を読み込む
-if "graph" not in st.session_state:
+if "memory" not in st.session_state:
     memory = load_memory()
-    st.session_state.graph = memory["graph"]
-    st.session_state.last_updated = memory["last_updated"]
-    st.session_state.graph = decay_memory(
-        st.session_state.graph,
-        st.session_state.last_updated
+    memory["graph"] = decay_memory(
+        memory["graph"],
+        memory["last_updated"]
     )
+    st.session_state.memory = memory
 
 # 入力欄
 query = st.text_area(
@@ -284,13 +421,11 @@ if st.button("🔍 考える", type="primary"):
         st.warning("質問を入力してください")
     else:
         with st.spinner("考え中..."):
-            best, graph, last_updated, result = rethink_ai(
+            best, memory, result = rethink_ai(
                 query,
-                st.session_state.graph,
-                st.session_state.last_updated
+                st.session_state.memory
             )
-            st.session_state.graph = graph
-            st.session_state.last_updated = last_updated
+            st.session_state.memory = memory
 
         if result is None:
             st.error("生成に失敗しました。もう一度試してください。")
@@ -301,19 +436,39 @@ if st.button("🔍 考える", type="primary"):
                 "mid":   "⚖️ バランス",
             }[result["purpose"]["type"]]
 
+            bonus_text = ""
+            if result["bonus"] > 0:
+                bonus_text += f" ／ 経験+{result['bonus']:.2f}"
+            if result["t_bonus"] > 0:
+                bonus_text += f" ／ 進化+{result['t_bonus']:.2f}"
+
             st.info(
                 f"**目的：** {purpose_jp} ／ "
                 f"**トピック：** {', '.join(result['topics'])}"
-                + (f" ／ **経験ボーナス：** +{result['bonus']:.2f}"
-                   if result['bonus'] > 0 else "")
+                + bonus_text
             )
+
+            # 矛盾探知の表示
+            if result["contradiction"] and result["contradiction_question"]:
+                st.warning(
+                    f"⚠️ **矛盾を検出！**\n\n"
+                    f"「{result['contradiction']['候補A']}」と\n"
+                    f"「{result['contradiction']['候補B']}」が拮抗\n\n"
+                    f"🤔 **自動生成した問い：**\n"
+                    f"「{result['contradiction_question']['question']}」\n\n"
+                    f"💡 理由：{result['contradiction_question']['reason']}"
+                )
 
             st.subheader("📋 候補一覧")
             labels = ["🥇 メイン視点", "🥈 サブ視点", "🥉 第三視点"]
-            colors = ["#fff9e6", "#f0fff0", "#f0f8ff"]
 
             for i, c in enumerate(result["candidates"][:3]):
-                s = score(c, result["purpose"]["weight"], result["bonus"])
+                s = score(
+                    c,
+                    result["purpose"]["weight"],
+                    result["bonus"],
+                    result["t_bonus"]
+                )
                 is_spark = (
                     result["sparked"] and
                     c["id"] == result["spark_pick"]["id"]
@@ -321,7 +476,7 @@ if st.button("🔍 考える", type="primary"):
                 spark = " ⚡閃き" if is_spark else ""
                 st.markdown(
                     f"**{labels[i]}{spark}** （score: {s:.1f}）\n\n"
-                    f"{c['text']}",
+                    f"{c['text']}"
                 )
                 st.divider()
 
@@ -331,8 +486,14 @@ if st.button("🔍 考える", type="primary"):
             )
 
             if result["patterns"]:
-                st.warning(
+                st.info(
                     f"💡 **パターン検出：** "
                     f"「{result['patterns'][0][0]}」との"
                     f"つながりを発見！"
                 )
+
+            # 自己進化ログ
+            if result["evolution_log"]:
+                with st.expander("🔬 自己進化ログ"):
+                    for log in result["evolution_log"]:
+                        st.text(log)
