@@ -19,16 +19,22 @@ MEMORY_FILE = "memory.json"
 # ============================================================
 
 def load_memory():
-    if os.path.exists(MEMORY_FILE):
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {
+    default = {
         "graph": {},
         "last_updated": {},
-        "contradiction_log": [],  # 矛盾の記録
-        "evolution_log": [],      # 自己進化の記録
-        "topic_weights": {},      # トピックの重み（自己進化）
+        "contradiction_log": [],
+        "evolution_log": [],
+        "topic_weights": {},
     }
+    if os.path.exists(MEMORY_FILE):
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # 古いファイルに項目が足りない場合に補完する
+        for key, value in default.items():
+            if key not in data:
+                data[key] = value
+        return data
+    return default
 
 def save_memory(memory):
     memory["saved_at"] = datetime.now().isoformat()
