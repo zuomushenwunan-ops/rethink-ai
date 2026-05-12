@@ -7,7 +7,7 @@ from datetime import datetime
 from google import genai
 
 # ============================================================
-# 再思考AI ver4.1 - 自己検証＋会話継続
+# 再思考AI ver4.2 - 複雑さ検知＋文字数自動調整
 # ============================================================
 
 client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
@@ -84,6 +84,33 @@ def detect_purpose(text):
     elif long > short: return {"type": "long",  "weight": 0.8}
     else:              return {"type": "mid",   "weight": 0.5}
 
+# ✅ 新機能: 問いの複雑さを検知
+def detect_complexity(query):
+    """
+    問いの複雑さを判定する
+    複雑な問い → 文字数制限を外す
+    シンプルな問い → 100文字以内
+    """
+    complexity_signals = [
+        "すべて", "全て", "全部",
+        "プロセス", "手順", "ステップ",
+        "詳しく", "詳細", "具体的に",
+        "計算", "証明", "説明して",
+        "条件", "制約", "厳守",
+        "連鎖", "逐次", "順番に",
+    ]
+    score = sum(1 for w in complexity_signals if w in query)
+    length_score = len(query) / 100
+
+    total = score + length_score
+
+    if total >= 3:
+        return "complex"    # 複雑→文字数制限なし
+    elif total >= 1.5:
+        return "medium"     # 中程度→300文字
+    else:
+        return "simple"     # シンプル→100文字
+
 def score(answer, purpose_weight, graph_bonus=0, topic_bonus=0):
     return round(
         answer["confidence"] * 60 * purpose_weight
@@ -153,18 +180,25 @@ def extract_topics(query):
                 time.sleep(3)
     return {"スキル習得", "反復練習"}
 
-def generate_answers(query, purpose, conversation_history=None):
+def generate_answers(query, purpose, complexity, conversation_history=None):
     style = {
         "short": "すぐ実践できる具体的な方法",
         "long":  "本質的な理解につながる方法",
         "mid":   "バランスのとれた方法",
     }[purpose["type"]]
 
-    # 会話履歴を含める
+    # 複雑さに応じて文字数を変える
+    length_instruction = {
+        "complex": "文字数制限なし・全プロセスを詳細に記述",
+        "medium":  "300文字程度で詳しく",
+        "simple":  "100文字以内で簡潔に",
+    }[complexity]
+
+    # 会話履歴
     history_text = ""
     if conversation_history:
         history_text = "\n\n【これまでの会話】\n"
-        for h in conversation_history[-3:]:  # 直近3件
+        for h in conversation_history[-3:]:
             history_text += f"問い：{h['query']}\n"
             history_text += f"答え：{h['answer']}\n\n"
 
@@ -172,11 +206,13 @@ def generate_answers(query, purpose, conversation_history=None):
 {history_text}
 「{query}」に対して、{style}で3つの異なる視点から答えてください。
 
+文字数：{length_instruction}
+
 必ずこのJSON形式のみで返してください（他の文字は不要）:
 [
-  {{"text": "答え1（100文字以内）", "confidence": 0.9}},
-  {{"text": "答え2（100文字以内）", "confidence": 0.7}},
-  {{"text": "答え3（100文字以内）", "confidence": 0.5}}
+  {{"text": "答え1", "confidence": 0.9}},
+  {{"text": "答え2", "confidence": 0.7}},
+  {{"text": "答え3", "confidence": 0.5}}
 ]
 """
     for attempt in range(3):
@@ -204,15 +240,7 @@ def generate_answers(query, purpose, conversation_history=None):
                 time.sleep(5)
     return []
 
-# ============================================================
-# 自己検証
-# ============================================================
-
 def self_verify(query, best_answer, topics):
-    """
-    AIが自分の答えを自分で検証する
-    「この答えで十分か？」を問う
-    """
     prompt = f"""
 あなたはAIです。以下の問いに対して以下の答えを出しました。
 
@@ -239,11 +267,7 @@ def self_verify(query, best_answer, topics):
         end   = text.rfind("}") + 1
         return json.loads(text[start:end])
     except:
-        return {
-            "sufficient": True,
-            "reason": "検証完了",
-            "follow_up": None
-        }
+        return {"sufficient": True, "reason": "検証完了", "follow_up": None}
 
 def detect_contradiction(scored, purpose_weight, graph_bonus):
     if len(scored) < 2:
@@ -262,8 +286,6 @@ def detect_contradiction(scored, purpose_weight, graph_bonus):
 def generate_questions_from_contradiction(contradiction, topics, query):
     topics_str = "・".join(list(topics)[:2])
     prompt = f"""
-以下の状況で2つの答えが拮抗しています：
-
 元の問い：「{query}」
 答えA：「{contradiction['候補A']}」
 答えB：「{contradiction['候補B']}」
@@ -315,28 +337,31 @@ def evolve(memory, topics, best_score, contradiction):
     return memory, evolution_log
 
 # ============================================================
-# メインループ ver4.1
+# メインループ ver4.2
 # ============================================================
 
 def rethink_ai(query, memory, conversation_history=None):
-    purpose = detect_purpose(query)
-    topics = extract_topics(query)
-    candidates = generate_answers(query, purpose, conversation_history)
+    purpose    = detect_purpose(query)
+    complexity = detect_complexity(query)
+    topics     = extract_topics(query)
+    candidates = generate_answers(
+        query, purpose, complexity, conversation_history
+    )
 
     if not candidates:
         return None, memory, None
 
-    graph = memory["graph"]
+    graph        = memory["graph"]
     last_updated = memory["last_updated"]
     topic_weights = memory.get("topic_weights", {})
 
-    bonus = graph_bonus_score(graph, topics)
+    bonus   = graph_bonus_score(graph, topics)
     t_bonus = topic_bonus_score(topic_weights, topics)
 
-    removed = set()
-    best = None
-    best_score = -999
-    contradiction = None
+    removed      = set()
+    best         = None
+    best_score   = -999
+    contradiction         = None
     contradiction_question = None
 
     for round_num in range(1, 4):
@@ -371,14 +396,13 @@ def rethink_ai(query, memory, conversation_history=None):
 
         removed.add(scored[-1]["id"])
 
-    memory["graph"] = graph
+    memory["graph"]        = graph
     memory["last_updated"] = last_updated
 
-    # 自己検証
     verification = self_verify(query, best["text"], topics)
-
-    # 自己進化
-    memory, evolution_log = evolve(memory, topics, best_score, contradiction)
+    memory, evolution_log = evolve(
+        memory, topics, best_score, contradiction
+    )
 
     save_memory(memory)
 
@@ -392,6 +416,7 @@ def rethink_ai(query, memory, conversation_history=None):
 
     return best, memory, {
         "purpose":    purpose,
+        "complexity": complexity,
         "topics":     topics,
         "bonus":      bonus,
         "t_bonus":    t_bonus,
@@ -402,13 +427,13 @@ def rethink_ai(query, memory, conversation_history=None):
             key=lambda c: score(c, purpose["weight"], bonus, t_bonus),
             reverse=True
         ),
-        "sparked":       sparked,
-        "spark_pick":    spark_pick,
-        "patterns":      patterns,
-        "contradiction": contradiction,
+        "sparked":                sparked,
+        "spark_pick":             spark_pick,
+        "patterns":               patterns,
+        "contradiction":          contradiction,
         "contradiction_question": contradiction_question,
-        "evolution_log": evolution_log,
-        "verification":  verification,
+        "evolution_log":          evolution_log,
+        "verification":           verification,
     }
 
 # ============================================================
@@ -421,10 +446,9 @@ st.set_page_config(
     layout="centered"
 )
 
-st.title("🧠 再思考AI ver4.1")
-st.caption("自己検証・会話継続・自己進化する再思考AI")
+st.title("🧠 再思考AI ver4.2")
+st.caption("複雑さを検知・自己検証・自己進化する再思考AI")
 
-# 記憶を読み込む
 if "memory" not in st.session_state:
     memory = load_memory()
     memory["graph"] = decay_memory(
@@ -433,18 +457,15 @@ if "memory" not in st.session_state:
     )
     st.session_state.memory = memory
 
-# 会話履歴
 if "conversation_history" not in st.session_state:
     st.session_state.conversation_history = []
 
-# 会話履歴の表示
 if st.session_state.conversation_history:
     st.subheader("💬 会話の流れ")
     for i, h in enumerate(st.session_state.conversation_history):
         with st.expander(f"問い{i+1}：{h['query'][:30]}..."):
             st.write(h['answer'])
 
-# 入力欄
 query = st.text_area(
     "質問を入力してください",
     placeholder="例：料理が上手くなりたい",
@@ -465,7 +486,14 @@ if think_btn:
     if not query.strip():
         st.warning("質問を入力してください")
     else:
-        with st.spinner("考え中..."):
+        complexity = detect_complexity(query)
+        complexity_jp = {
+            "complex": "🔴 複雑（詳細モード）",
+            "medium":  "🟡 中程度（標準モード）",
+            "simple":  "🟢 シンプル（簡潔モード）",
+        }[complexity]
+
+        with st.spinner(f"考え中... {complexity_jp}"):
             best, memory, result = rethink_ai(
                 query,
                 st.session_state.memory,
@@ -490,11 +518,11 @@ if think_btn:
 
             st.info(
                 f"**目的：** {purpose_jp} ／ "
+                f"**複雑さ：** {complexity_jp} ／ "
                 f"**トピック：** {', '.join(result['topics'])}"
                 + bonus_text
             )
 
-            # 矛盾探知
             if result["contradiction"] and result["contradiction_question"]:
                 st.warning(
                     f"⚠️ **矛盾を検出！**\n\n"
@@ -529,20 +557,16 @@ if think_btn:
                 f"**{result['best']['text']}**"
             )
 
-            # 自己検証の表示
             verification = result["verification"]
             if not verification["sufficient"] and verification["follow_up"]:
                 st.info(
-                    f"🤖 **自己検証：この答えで十分か確認しました**\n\n"
-                    f"判定：{'✅ 十分' if verification['sufficient'] else '❓ 追加情報が必要'}\n"
+                    f"🤖 **自己検証：追加情報が必要**\n\n"
                     f"理由：{verification['reason']}\n\n"
                     f"💬 **続けて答えてください：**\n"
                     f"「{verification['follow_up']}」"
                 )
             else:
-                st.info(
-                    f"🤖 **自己検証：** {verification['reason']}"
-                )
+                st.info(f"🤖 **自己検証：** {verification['reason']}")
 
             if result["patterns"]:
                 st.info(
@@ -556,7 +580,6 @@ if think_btn:
                     for log in result["evolution_log"]:
                         st.text(log)
 
-            # 会話履歴に追加
             st.session_state.conversation_history.append({
                 "query":  query,
                 "answer": result["best"]["text"],
