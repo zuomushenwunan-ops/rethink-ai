@@ -8,7 +8,7 @@ from datetime import datetime
 from google import genai
 
 # ============================================================
-# 再思考AI ver4.3 - 情報トポロジー＋三角錐収束
+# 再思考AI ver5.0 - 本物の再思考エンジン
 # ============================================================
 
 client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
@@ -26,7 +26,7 @@ def load_memory():
         "contradiction_log": [],
         "evolution_log": [],
         "topic_weights": {},
-        "topology": {},  # 情報トポロジー
+        "topology": {},
     }
     if os.path.exists(MEMORY_FILE):
         with open(MEMORY_FILE, "r", encoding="utf-8") as f:
@@ -79,14 +79,7 @@ def update_graph(graph, last_updated, topics, top_score):
 # 情報トポロジー
 # ============================================================
 
-def calc_info_distance(strength):
-    """強度から距離を計算（強いほど近い）"""
-    if strength <= 0:
-        return 1.0
-    return round(1 - strength, 3)
-
 def update_topology(topology, topics, scores):
-    """情報トポロジーを更新"""
     topics = list(topics)
     for i in range(len(topics)):
         for j in range(i+1, len(topics)):
@@ -94,80 +87,54 @@ def update_topology(topology, topics, scores):
             key = f"{a}↔{b}"
             avg_score = sum(scores) / len(scores) if scores else 0
             strength = avg_score / 100
-
             if key not in topology:
-                topology[key] = {
-                    "強度": 0,
-                    "距離": 1.0,
-                    "連結性": "弱",
-                }
-
+                topology[key] = {"強度": 0, "距離": 1.0, "連結性": "弱"}
             topology[key]["強度"] = round(
                 topology[key]["強度"] * 0.7 + strength * 0.3, 3
             )
-            topology[key]["距離"] = calc_info_distance(
-                topology[key]["強度"]
+            topology[key]["距離"] = round(
+                1 - topology[key]["強度"], 3
             )
             topology[key]["連結性"] = (
                 "強" if topology[key]["強度"] > 0.6 else
                 "中" if topology[key]["強度"] > 0.3 else
                 "弱"
             )
-
     return topology
 
 # ============================================================
 # 三角錐収束
 # ============================================================
 
-def build_pyramid(candidates, topics, purpose_weight, bonus, t_bonus):
-    """
-    3つの視点を三角錐として収束させる
-    底面：3つの視点（候補）
-    頂点：収束した最終答え
-    """
-    if len(candidates) < 3:
+def build_pyramid(steps, purpose_weight, bonus, t_bonus):
+    if len(steps) < 3:
         return None
 
-    scored = sorted(
-        candidates,
-        key=lambda c: score(c, purpose_weight, bonus, t_bonus),
-        reverse=True
-    )[:3]
+    scores = [s["score"] for s in steps[-3:]]
+    last3  = steps[-3:]
 
-    # 底面の各辺の距離を計算
-    s = [score(c, purpose_weight, bonus, t_bonus) for c in scored]
-
-    ab_dist = round(abs(s[0] - s[1]) / 100, 3)
-    bc_dist = round(abs(s[1] - s[2]) / 100, 3)
-    ca_dist = round(abs(s[2] - s[0]) / 100, 3)
-
-    # 収束スコア（距離が小さいほど収束してる）
-    avg_dist = (ab_dist + bc_dist + ca_dist) / 3
-    convergence = round(1 - avg_dist, 3)
-
-    # 頂点（収束した答え）を生成
-    # スコアの重み付き平均で最終答えを決定
-    total_score = sum(max(s_i, 0.001) for s_i in s)
-    weights = [max(s_i, 0.001) / total_score for s_i in s]
+    ab = round(abs(scores[0] - scores[1]) / 100, 3)
+    bc = round(abs(scores[1] - scores[2]) / 100, 3)
+    ca = round(abs(scores[2] - scores[0]) / 100, 3)
+    convergence = round(1 - (ab + bc + ca) / 3, 3)
 
     return {
         "底面": [
             {
-                "視点": ["メイン", "サブ", "第三"][i],
-                "答え": scored[i]["text"],
-                "score": s[i],
-                "重み": round(weights[i], 3),
+                "ステップ": i+1,
+                "答え": last3[i]["answer"][:60] + "...",
+                "score": scores[i],
+                "弱点": last3[i].get("weakness", ""),
             }
             for i in range(3)
         ],
         "辺": {
-            "メイン↔サブ距離": ab_dist,
-            "サブ↔第三距離": bc_dist,
-            "第三↔メイン距離": ca_dist,
+            "Step1↔Step2距離": ab,
+            "Step2↔Step3距離": bc,
+            "Step3↔Step1距離": ca,
         },
         "収束スコア": convergence,
-        "頂点": scored[0]["text"],  # 最高スコアが頂点
+        "頂点": last3[-1]["answer"],
     }
 
 # ============================================================
@@ -182,19 +149,17 @@ def detect_purpose(text):
     else:              return {"type": "mid",   "weight": 0.5}
 
 def detect_complexity(query):
-    complexity_signals = [
-        "すべて","全て","全部","プロセス","手順","ステップ",
-        "詳しく","詳細","具体的に","計算","証明","説明して",
-        "条件","制約","厳守","連鎖","逐次","順番に",
+    signals = [
+        "すべて","全て","プロセス","手順","詳しく","詳細",
+        "計算","証明","条件","制約","連鎖","逐次",
     ]
-    score_c = sum(1 for w in complexity_signals if w in query)
-    length_score = len(query) / 100
-    total = score_c + length_score
-    if total >= 3:    return "complex"
+    sc = sum(1 for w in signals if w in query)
+    total = sc + len(query) / 100
+    if total >= 3:     return "complex"
     elif total >= 1.5: return "medium"
-    else:             return "simple"
+    else:              return "simple"
 
-def score(answer, purpose_weight, graph_bonus=0, topic_bonus=0):
+def score_answer(answer, purpose_weight, graph_bonus=0, topic_bonus=0):
     return round(
         answer["confidence"] * 60 * purpose_weight
         - answer["variation"] * 0.25
@@ -211,8 +176,7 @@ def graph_bonus_score(graph, topics):
     return round(total * 2, 2)
 
 def topic_bonus_score(topic_weights, topics):
-    total = sum(topic_weights.get(t, 0) for t in topics)
-    return round(total, 2)
+    return round(sum(topic_weights.get(t, 0) for t in topics), 2)
 
 def graph_pattern(graph, topics):
     hits = []
@@ -223,21 +187,16 @@ def graph_pattern(graph, topics):
                     hits.append((connected, strength))
     return sorted(hits, key=lambda x: x[1], reverse=True)
 
-def probabilistic_spark(candidates, rate=0.2):
-    if len(candidates) >= 2 and random.random() < rate:
-        return random.choice(candidates[1:]), True
-    return candidates[0], False
-
 def extract_topics(query):
     prompt = f"""
-以下の文章から、最も重要な具体的なトピックを3つ抽出してください。
+以下の文章から具体的なトピックを3つ抽出してください。
 
 文章:「{query}」
 
 ルール：
 - 各トピックは2〜6文字の日本語
 - 「一般」「理解」など曖昧な言葉は使わない
-- 必ずこのJSON形式のみで返す（他の文字不要）
+- 必ずこのJSON形式のみで返す
 
 ["トピック1", "トピック2", "トピック3"]
 """
@@ -253,88 +212,69 @@ def extract_topics(query):
             topics = json.loads(text[start:end])
             filtered = [
                 t for t in topics[:3]
-                if t not in ["一般", "理解", "学習", "練習", "上達"]
+                if t not in ["一般","理解","学習","練習","上達"]
             ]
-            if len(filtered) >= 2:
-                return set(filtered)
-            return set(topics[:3])
+            return set(filtered) if len(filtered) >= 2 else set(topics[:3])
         except:
             if attempt < 2:
                 time.sleep(3)
     return {"スキル習得", "反復練習"}
 
-def generate_answers(query, purpose, complexity, conversation_history=None):
-    style = {
-        "short": "すぐ実践できる具体的な方法",
-        "long":  "本質的な理解につながる方法",
-        "mid":   "バランスのとれた方法",
-    }[purpose["type"]]
+# ============================================================
+# 本物の再思考エンジン
+# ============================================================
 
-    length_instruction = {
-        "complex": "文字数制限なし・全プロセスを詳細に記述",
-        "medium":  "300文字程度で詳しく",
-        "simple":  "100文字以内で簡潔に",
+def first_answer(query, purpose, complexity):
+    """ステップ1：最初の答えを出す"""
+    length = {
+        "complex": "詳細に",
+        "medium":  "300文字程度で",
+        "simple":  "100文字以内で",
     }[complexity]
 
-    history_text = ""
-    if conversation_history:
-        history_text = "\n\n【これまでの会話】\n"
-        for h in conversation_history[-3:]:
-            history_text += f"問い：{h['query']}\n"
-            history_text += f"答え：{h['answer']}\n\n"
-
     prompt = f"""
-{history_text}
-「{query}」に対して、{style}で3つの異なる視点から答えてください。
+「{query}」に対して、{length}現実的・科学的な根拠に基づいて答えてください。
 
-文字数：{length_instruction}
+ルール：
+- 投機的・SF的な答えは避ける
+- 現在の研究で議論されている範囲内で
+- 必ずこのJSON形式のみで返す
 
-必ずこのJSON形式のみで返してください（他の文字は不要）:
-[
-  {{"text": "答え1", "confidence": 0.9}},
-  {{"text": "答え2", "confidence": 0.7}},
-  {{"text": "答え3", "confidence": 0.5}}
-]
+{{"answer": "答え", "confidence": 0.0〜1.0}}
 """
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt
-            )
-            text = response.text.strip()
-            start = text.find("[")
-            end   = text.rfind("]") + 1
-            data  = json.loads(text[start:end])
-            candidates = []
-            for i, d in enumerate(data[:3]):
-                candidates.append({
-                    "id":         i + 1,
-                    "text":       d["text"],
-                    "confidence": float(d["confidence"]),
-                    "variation":  round(20 + i * 20, 1),
-                    "length":     round(len(d["text"]) / 10, 1),
-                })
-            return candidates
-        except Exception as e:
-            if attempt < 2:
-                time.sleep(5)
-    return []
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        text = response.text.strip()
+        start = text.find("{")
+        end   = text.rfind("}") + 1
+        data  = json.loads(text[start:end])
+        return {
+            "answer":     data["answer"],
+            "confidence": float(data["confidence"]),
+            "variation":  20,
+            "length":     round(len(data["answer"]) / 10, 1),
+            "step":       1,
+        }
+    except:
+        return None
 
-def self_verify(query, best_answer, topics):
+def find_weakness(query, answer, step):
+    """ステップN：前の答えの弱点を見つける"""
     prompt = f"""
 問い：「{query}」
-答え：「{best_answer}」
-トピック：{', '.join(topics)}
+前の答え（ステップ{step}）：「{answer}」
 
-この答えを自己検証してください。
+この答えの最も重要な弱点・不足点を1つ指摘してください。
 
-必ずこのJSON形式のみで返してください：
-{{
-  "sufficient": true or false,
-  "reason": "理由（30文字以内）",
-  "follow_up": "追加質問（不十分でない場合はnull）"
-}}
+ルール：
+- 現実的・論理的な観点から
+- 感情的・SF的な指摘は避ける
+- 必ずこのJSON形式のみで返す
+
+{{"weakness": "弱点（50文字以内）", "direction": "改善の方向性（30文字以内）"}}
 """
     try:
         response = client.models.generate_content(
@@ -346,32 +286,33 @@ def self_verify(query, best_answer, topics):
         end   = text.rfind("}") + 1
         return json.loads(text[start:end])
     except:
-        return {"sufficient": True, "reason": "検証完了", "follow_up": None}
+        return {"weakness": "不明", "direction": "別の視点から考える"}
 
-def detect_contradiction(scored, purpose_weight, graph_bonus):
-    if len(scored) < 2:
-        return None
-    s1 = score(scored[0], purpose_weight, graph_bonus)
-    s2 = score(scored[1], purpose_weight, graph_bonus)
-    diff = abs(s1 - s2)
-    if diff < 5:
-        return {
-            "候補A": scored[0]["text"][:30] + "...",
-            "候補B": scored[1]["text"][:30] + "...",
-            "差": round(diff, 1),
-        }
-    return None
+def rethink_answer(query, prev_answer, weakness, direction,
+                   purpose, complexity, step):
+    """ステップN+1：弱点を踏まえて考え直す"""
+    length = {
+        "complex": "詳細に",
+        "medium":  "300文字程度で",
+        "simple":  "100文字以内で",
+    }[complexity]
 
-def generate_questions_from_contradiction(contradiction, topics, query):
-    topics_str = "・".join(list(topics)[:2])
     prompt = f"""
-元の問い：「{query}」
-答えA：「{contradiction['候補A']}」
-答えB：「{contradiction['候補B']}」
-関連トピック：{topics_str}
+問い：「{query}」
 
-必ずこのJSON形式のみで返してください：
-{{"question": "問いの内容", "reason": "理由（30文字以内）"}}
+前の答え：「{prev_answer}」
+前の答えの弱点：「{weakness}」
+改善の方向性：「{direction}」
+
+この弱点を克服した、より深い答えを{length}考えてください。
+
+ルール：
+- 現実的・科学的な根拠に基づく
+- 投機的・SF的な答えは避ける
+- 前の答えより具体的・深く
+- 必ずこのJSON形式のみで返す
+
+{{"answer": "答え", "confidence": 0.0〜1.0, "improvement": "前の答えからの改善点（30文字以内）"}}
 """
     try:
         response = client.models.generate_content(
@@ -381,52 +322,50 @@ def generate_questions_from_contradiction(contradiction, topics, query):
         text = response.text.strip()
         start = text.find("{")
         end   = text.rfind("}") + 1
-        return json.loads(text[start:end])
-    except:
+        data  = json.loads(text[start:end])
         return {
-            "question": f"なぜ「{topics_str}」で答えが割れるのか？",
-            "reason": "矛盾の根本を探る"
+            "answer":      data["answer"],
+            "confidence":  float(data["confidence"]),
+            "improvement": data.get("improvement", ""),
+            "variation":   15,
+            "length":      round(len(data["answer"]) / 10, 1),
+            "step":        step,
         }
+    except:
+        return None
 
-def evolve(memory, topics, best_score, contradiction):
+def evolve(memory, topics, best_score, has_contradiction):
     evolution_log = []
     topic_weights = memory.get("topic_weights", {})
 
-    if contradiction:
+    if has_contradiction:
         for t in topics:
             prev = topic_weights.get(t, 0)
             topic_weights[t] = round(prev - 0.05, 3)
             evolution_log.append(
-                f"「{t}」重みを調整: {prev:.2f}→{topic_weights[t]:.2f}"
+                f"「{t}」調整: {prev:.2f}→{topic_weights[t]:.2f}"
             )
     elif best_score > 30:
         for t in topics:
             prev = topic_weights.get(t, 0)
             topic_weights[t] = round(prev + 0.1, 3)
             evolution_log.append(
-                f"「{t}」重みを強化: {prev:.2f}→{topic_weights[t]:.2f}"
+                f"「{t}」強化: {prev:.2f}→{topic_weights[t]:.2f}"
             )
 
     memory["topic_weights"] = topic_weights
     memory["evolution_log"].extend(evolution_log)
     memory["evolution_log"] = memory["evolution_log"][-10:]
-
     return memory, evolution_log
 
 # ============================================================
-# メインループ ver4.3
+# メインループ ver5.0
 # ============================================================
 
 def rethink_ai(query, memory, conversation_history=None):
     purpose    = detect_purpose(query)
     complexity = detect_complexity(query)
     topics     = extract_topics(query)
-    candidates = generate_answers(
-        query, purpose, complexity, conversation_history
-    )
-
-    if not candidates:
-        return None, memory, None
 
     graph         = memory["graph"]
     last_updated  = memory["last_updated"]
@@ -436,49 +375,78 @@ def rethink_ai(query, memory, conversation_history=None):
     bonus   = graph_bonus_score(graph, topics)
     t_bonus = topic_bonus_score(topic_weights, topics)
 
-    removed               = set()
-    best                  = None
-    best_score_val        = -999
-    contradiction         = None
-    contradiction_question = None
-    all_scores            = []
+    # ============================================================
+    # 本物の再思考ループ
+    # ステップ1：最初の答え
+    # ステップ2：弱点発見→考え直す
+    # ステップ3：さらに弱点発見→考え直す
+    # ============================================================
 
-    for round_num in range(1, 4):
-        active = [c for c in candidates if c["id"] not in removed]
-        if not active:
-            break
+    steps = []
+    all_scores = []
 
-        scored = sorted(
-            active,
-            key=lambda c: score(c, purpose["weight"], bonus, t_bonus),
-            reverse=True
-        )
+    # ステップ1
+    ans1 = first_answer(query, purpose, complexity)
+    if not ans1:
+        return None, memory, None
 
-        top_score = score(scored[0], purpose["weight"], bonus, t_bonus)
-        all_scores.append(top_score)
+    s1 = score_answer(ans1, purpose["weight"], bonus, t_bonus)
+    steps.append({
+        "step":     1,
+        "answer":   ans1["answer"],
+        "score":    s1,
+        "weakness": "",
+        "improvement": "最初の答え",
+    })
+    all_scores.append(s1)
 
-        if top_score > best_score_val:
-            best_score_val = top_score
-            best = scored[0]
+    graph, last_updated = update_graph(
+        graph, last_updated, topics, s1 / 100
+    )
 
-        contradiction = detect_contradiction(
-            scored, purpose["weight"], bonus
-        )
-        if contradiction:
-            contradiction_question = (
-                generate_questions_from_contradiction(
-                    contradiction, topics, query
-                )
-            )
+    # ステップ2：弱点を見つけて考え直す
+    w1 = find_weakness(query, ans1["answer"], 1)
+    ans2 = rethink_answer(
+        query, ans1["answer"],
+        w1["weakness"], w1["direction"],
+        purpose, complexity, 2
+    )
 
+    if ans2:
+        s2 = score_answer(ans2, purpose["weight"], bonus, t_bonus)
+        steps.append({
+            "step":        2,
+            "answer":      ans2["answer"],
+            "score":       s2,
+            "weakness":    w1["weakness"],
+            "improvement": ans2.get("improvement", ""),
+        })
+        all_scores.append(s2)
         graph, last_updated = update_graph(
-            graph, last_updated, topics, top_score / 100
+            graph, last_updated, topics, s2 / 100
         )
 
-        if round_num >= 3:
-            break
+        # ステップ3：さらに弱点を見つけて考え直す
+        w2 = find_weakness(query, ans2["answer"], 2)
+        ans3 = rethink_answer(
+            query, ans2["answer"],
+            w2["weakness"], w2["direction"],
+            purpose, complexity, 3
+        )
 
-        removed.add(scored[-1]["id"])
+        if ans3:
+            s3 = score_answer(ans3, purpose["weight"], bonus, t_bonus)
+            steps.append({
+                "step":        3,
+                "answer":      ans3["answer"],
+                "score":       s3,
+                "weakness":    w2["weakness"],
+                "improvement": ans3.get("improvement", ""),
+            })
+            all_scores.append(s3)
+            graph, last_updated = update_graph(
+                graph, last_updated, topics, s3 / 100
+            )
 
     memory["graph"]        = graph
     memory["last_updated"] = last_updated
@@ -487,52 +455,35 @@ def rethink_ai(query, memory, conversation_history=None):
     topology = update_topology(topology, topics, all_scores)
     memory["topology"] = topology
 
-    # 三角錐収束
-    pyramid = build_pyramid(
-        candidates, topics, purpose["weight"], bonus, t_bonus
-    )
+    # 最良ステップを選ぶ
+    best_step  = max(steps, key=lambda s: s["score"])
+    best_score = best_step["score"]
 
-    verification = self_verify(query, best["text"], topics)
+    # 三角錐収束
+    pyramid = build_pyramid(steps, purpose["weight"], bonus, t_bonus)
+
+    # 自己進化
     memory, evolution_log = evolve(
-        memory, topics, best_score_val, contradiction
+        memory, topics, best_score, False
     )
 
     save_memory(memory)
 
-    spark_pick, sparked = probabilistic_spark(
-        sorted(candidates,
-               key=lambda c: score(
-                   c, purpose["weight"], bonus, t_bonus
-               ),
-               reverse=True)
-    )
-
     patterns = graph_pattern(graph, topics)
 
-    return best, memory, {
-        "purpose":    purpose,
-        "complexity": complexity,
-        "topics":     topics,
-        "bonus":      bonus,
-        "t_bonus":    t_bonus,
-        "best":       best,
-        "best_score": best_score_val,
-        "candidates": sorted(
-            candidates,
-            key=lambda c: score(
-                c, purpose["weight"], bonus, t_bonus
-            ),
-            reverse=True
-        ),
-        "sparked":                sparked,
-        "spark_pick":             spark_pick,
-        "patterns":               patterns,
-        "contradiction":          contradiction,
-        "contradiction_question": contradiction_question,
-        "evolution_log":          evolution_log,
-        "verification":           verification,
-        "pyramid":                pyramid,
-        "topology":               topology,
+    return best_step, memory, {
+        "purpose":       purpose,
+        "complexity":    complexity,
+        "topics":        topics,
+        "bonus":         bonus,
+        "t_bonus":       t_bonus,
+        "best":          best_step,
+        "best_score":    best_score,
+        "steps":         steps,
+        "patterns":      patterns,
+        "evolution_log": evolution_log,
+        "pyramid":       pyramid,
+        "topology":      topology,
     }
 
 # ============================================================
@@ -545,8 +496,8 @@ st.set_page_config(
     layout="centered"
 )
 
-st.title("🧠 再思考AI ver4.3")
-st.caption("情報トポロジー＋三角錐収束・自己進化する再思考AI")
+st.title("🧠 再思考AI ver5.0")
+st.caption("本物の再思考エンジン・深化するたびに賢くなる")
 
 if "memory" not in st.session_state:
     memory = load_memory()
@@ -585,14 +536,14 @@ if think_btn:
     if not query.strip():
         st.warning("質問を入力してください")
     else:
-        complexity = detect_complexity(query)
+        complexity    = detect_complexity(query)
         complexity_jp = {
             "complex": "🔴 複雑（詳細モード）",
             "medium":  "🟡 中程度（標準モード）",
             "simple":  "🟢 シンプル（簡潔モード）",
         }[complexity]
 
-        with st.spinner(f"考え中... {complexity_jp}"):
+        with st.spinner(f"再思考中... {complexity_jp}"):
             best, memory, result = rethink_ai(
                 query,
                 st.session_state.memory,
@@ -622,95 +573,73 @@ if think_btn:
                 + bonus_text
             )
 
-            if result["contradiction"] and result["contradiction_question"]:
-                st.warning(
-                    f"⚠️ **矛盾を検出！**\n\n"
-                    f"🤔 **自動生成した問い：**\n"
-                    f"「{result['contradiction_question']['question']}」\n\n"
-                    f"💡 理由：{result['contradiction_question']['reason']}"
-                )
+            # 再思考プロセスを表示
+            st.subheader("🔄 再思考プロセス")
+            for step in result["steps"]:
+                if step["step"] == 1:
+                    label = "💭 ステップ1：最初の答え"
+                else:
+                    label = (
+                        f"🔄 ステップ{step['step']}："
+                        f"再思考（弱点：{step['weakness']}）"
+                    )
 
-            st.subheader("📋 候補一覧")
-            labels = ["🥇 メイン視点", "🥈 サブ視点", "🥉 第三視点"]
+                with st.expander(
+                    f"{label} （score: {step['score']:.1f}）"
+                ):
+                    st.write(step["answer"])
+                    if step.get("improvement") and step["step"] > 1:
+                        st.caption(
+                            f"改善点：{step['improvement']}"
+                        )
 
-            for i, c in enumerate(result["candidates"][:3]):
-                s = score(
-                    c,
-                    result["purpose"]["weight"],
-                    result["bonus"],
-                    result["t_bonus"]
-                )
-                is_spark = (
-                    result["sparked"] and
-                    c["id"] == result["spark_pick"]["id"]
-                )
-                spark = " ⚡閃き" if is_spark else ""
-                st.markdown(
-                    f"**{labels[i]}{spark}** （score: {s:.1f}）\n\n"
-                    f"{c['text']}"
-                )
-                st.divider()
-
+            # 最終答え
             st.success(
-                f"✅ **推奨** （score: {result['best_score']:.1f}）\n\n"
-                f"**{result['best']['text']}**"
+                f"✅ **最終答え** "
+                f"（ステップ{result['best']['step']} / "
+                f"score: {result['best_score']:.1f}）\n\n"
+                f"**{result['best']['answer']}**"
             )
 
-            # 三角錐収束の表示
+            # 三角錐収束
             if result["pyramid"]:
                 p = result["pyramid"]
                 convergence = p["収束スコア"]
                 conv_label = (
-                    "🔺 高収束（視点が一致）" if convergence > 0.7 else
+                    "🔺 高収束" if convergence > 0.7 else
                     "🔸 中収束" if convergence > 0.4 else
-                    "🔹 低収束（視点が分散）"
+                    "🔹 低収束（思考が発散・深化中）"
                 )
                 with st.expander(
-                    f"🔺 三角錐収束 （収束スコア: {convergence}）"
-                    f" {conv_label}"
+                    f"🔺 三角錐収束 "
+                    f"（収束スコア: {convergence}）{conv_label}"
                 ):
-                    st.markdown("**底面（3つの視点）：**")
                     for face in p["底面"]:
                         st.markdown(
-                            f"- **{face['視点']}** "
-                            f"（重み: {face['重み']}）: "
-                            f"{face['答え'][:50]}..."
+                            f"- **ステップ{face['ステップ']}** "
+                            f"（score: {face['score']:.1f}）: "
+                            f"{face['答え']}"
                         )
-                    st.markdown("**辺（視点間の距離）：**")
+                    st.markdown("**視点間の距離：**")
                     for edge, dist in p["辺"].items():
                         closeness = "近い" if dist < 0.3 else "遠い"
-                        st.markdown(f"- {edge}: {dist} ({closeness})")
-                    st.markdown(
-                        f"**頂点（収束した答え）：**\n\n"
-                        f"{p['頂点']}"
-                    )
+                        st.markdown(
+                            f"- {edge}: {dist} ({closeness})"
+                        )
 
-            # 情報トポロジーの表示
-            relevant_topology = {
+            # 情報トポロジー
+            relevant = {
                 k: v for k, v in result["topology"].items()
                 if any(t in k for t in result["topics"])
             }
-            if relevant_topology:
+            if relevant:
                 with st.expander("🌐 情報トポロジー"):
-                    for key, val in relevant_topology.items():
+                    for key, val in relevant.items():
                         st.markdown(
                             f"**{key}**：強度={val['強度']} ／ "
                             f"距離={val['距離']} ／ "
                             f"連結性={val['連結性']}"
                         )
-
-            verification = result["verification"]
-            if not verification["sufficient"] and verification["follow_up"]:
-                st.info(
-                    f"🤖 **自己検証：追加情報が必要**\n\n"
-                    f"理由：{verification['reason']}\n\n"
-                    f"💬 **続けて答えてください：**\n"
-                    f"「{verification['follow_up']}」"
-                )
-            else:
-                st.info(
-                    f"🤖 **自己検証：** {verification['reason']}"
-                )
 
             if result["patterns"]:
                 st.info(
@@ -726,6 +655,6 @@ if think_btn:
 
             st.session_state.conversation_history.append({
                 "query":  query,
-                "answer": result["best"]["text"],
+                "answer": result["best"]["answer"],
                 "topics": list(result["topics"]),
             })
